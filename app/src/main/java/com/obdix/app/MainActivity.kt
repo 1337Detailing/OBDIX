@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.obdix.app.core.*
+import com.obdix.app.bmw.BmwResponseState
 import com.obdix.app.transport.ConnectionSpec
 import com.obdix.app.transport.LinkType
 import java.util.Locale
@@ -201,6 +202,7 @@ private fun ConnectPage(s: AppState, model: ObdViewModel) {
                     LinkType.BLE -> "BLE"
                     LinkType.WIFI -> "Wi-Fi"
                     LinkType.USB -> "USB"
+                    LinkType.KDCAN -> "K+DCAN"
                 }) }
             )
         }
@@ -228,7 +230,8 @@ private fun ConnectPage(s: AppState, model: ObdViewModel) {
                 Text(when (type) {
                     LinkType.BLUETOOTH -> "Associez votre ELM327 dans les réglages Android."
                     LinkType.BLE -> "Les modules BLE ELM doivent exposer un service UART compatible."
-                    LinkType.USB -> "Branchez un adaptateur USB-série avec câble OTG."
+                    LinkType.USB -> "Branchez un adaptateur ELM327 USB-série avec câble OTG."
+                    LinkType.KDCAN -> "Utilisez un câble BMW K+DCAN USB (FTDI recommandé), moteur arrêté, contact établi."
                     else -> ""
                 }, style = MaterialTheme.typography.bodySmall)
             }
@@ -258,6 +261,8 @@ private fun ConnectPage(s: AppState, model: ObdViewModel) {
                 LinkType.WIFI -> ConnectionSpec(type, host.trim(), tcpPort.toIntOrNull() ?: 35000)
                 LinkType.USB -> ConnectionSpec(type, usbDeviceId = chosen?.toIntOrNull() ?: -1,
                     baudRate = serialSpeed.toIntOrNull() ?: 38400)
+                LinkType.KDCAN -> ConnectionSpec(type, usbDeviceId = chosen?.toIntOrNull() ?: -1,
+                    baudRate = 115200)
                 else -> ConnectionSpec(type, address = chosen.orEmpty())
             }
             model.connect(spec)
@@ -267,7 +272,8 @@ private fun ConnectPage(s: AppState, model: ObdViewModel) {
         modifier = Modifier.fillMaxWidth()
     ) { Text("Connecter") }
     Spacer(Modifier.height(16.dp))
-    Text("La détection automatique couvre les protocoles pris en charge par le firmware ELM.",
+    Text(if (type == LinkType.KDCAN) "K+DCAN natif : pas de commandes AT ELM327. Identifier les ECU dans Défauts."
+        else "La détection automatique couvre les protocoles pris en charge par le firmware ELM.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
@@ -275,6 +281,33 @@ private fun ConnectPage(s: AppState, model: ObdViewModel) {
 @Composable
 private fun FaultPage(s: AppState, model: ObdViewModel) {
     var confirm by remember { mutableStateOf(false) }
+    if (s.bmwMode) {
+        PageTitle("BMW E-Series", "Identification expérimentale des calculateurs via K+DCAN.")
+        Button(onClick = { model.identifyBmw() },
+            enabled = s.connected && !s.busy) { Text("Identifier les calculateurs") }
+        Spacer(Modifier.height(14.dp))
+        if (s.bmwIdentities.isEmpty()) {
+            NoticeCard("Lecture seule", "Cette étape vérifie la communication BMW-FAST. Lecture des défauts BMW, CBS et codage exigent encore les jobs .PRG spécifiques.")
+        } else s.bmwIdentities.forEach { ecu ->
+            ElevatedCard(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                Column(Modifier.padding(16.dp)) {
+                    Text(ecu.name, style = MaterialTheme.typography.titleMedium)
+                    Text("Adresse %02X · %s".format(ecu.address,
+                        when (ecu.status) {
+                            BmwResponseState.POSITIVE -> "Réponse positive"
+                            BmwResponseState.NEGATIVE -> "Réponse négative"
+                            BmwResponseState.NO_REPLY -> "Injoignable"
+                            BmwResponseState.INVALID -> "Non reconnue"
+                        }), style = MaterialTheme.typography.labelMedium)
+                    Spacer(Modifier.height(6.dp))
+                    Text(ecu.detail, style = MaterialTheme.typography.bodySmall)
+                    if (ecu.responseHex.isNotBlank())
+                        Text(ecu.responseHex, style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
+        return
+    }
     PageTitle("Défauts", "Calculateurs moteur/émissions OBD-II uniquement.")
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Button(onClick = { model.scanFaults() }, enabled = s.connected && !s.busy) {
@@ -323,13 +356,13 @@ private fun FaultPage(s: AppState, model: ObdViewModel) {
 @Composable
 private fun LivePage(s: AppState, model: ObdViewModel) {
     PageTitle("Temps réel", "Seuls les paramètres déclarés compatibles sont interrogés.")
-    Button(onClick = { model.togglePolling() }, enabled = s.connected,
+    Button(onClick = { model.togglePolling() }, enabled = s.connected && !s.bmwMode,
         modifier = Modifier.fillMaxWidth()) {
         Text(if (s.polling) "Arrêter les mesures" else "Démarrer les mesures")
     }
     Spacer(Modifier.height(18.dp))
-    if (!s.connected) {
-        NoticeCard("En attente de connexion", "Connectez votre interface pour détecter les PID.")
+    if (!s.connected || s.bmwMode) {
+        NoticeCard("En attente de liaison OBD-II", "Connectez un ELM327 pour les PID standard ; le K+DCAN utilise la page BMW.")
         return
     }
     StandardPids.catalog.filter { it.pid in s.supported }.forEach { definition ->

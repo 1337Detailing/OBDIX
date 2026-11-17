@@ -32,7 +32,7 @@ interface ByteTransport {
     suspend fun close()
 }
 
-enum class LinkType { BLUETOOTH, BLE, WIFI, USB }
+enum class LinkType { BLUETOOTH, BLE, WIFI, USB, KDCAN }
 
 data class ConnectionSpec(
     val type: LinkType,
@@ -57,7 +57,7 @@ object TransportFactory {
                 BleTransport.connect(context, adapter.getRemoteDevice(spec.address))
             }
             LinkType.WIFI -> NetworkTransport.connect(spec.address, spec.port)
-            LinkType.USB -> UsbTransport.connect(context, spec.usbDeviceId, spec.baudRate)
+            LinkType.USB, LinkType.KDCAN -> UsbTransport.connect(context, spec.usbDeviceId, spec.baudRate)
         }
     }
 }

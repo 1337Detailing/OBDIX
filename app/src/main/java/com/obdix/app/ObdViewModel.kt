@@ -18,6 +18,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.obdix.app.core.*
+import com.obdix.app.bmw.BmwEcuIdentity
+import com.obdix.app.bmw.BmwKdcSession
+import com.obdix.app.bmw.BmwE90Addresses
 import com.obdix.app.transport.ConnectionSpec
 import com.obdix.app.transport.LinkType
 import com.obdix.app.transport.TransportFactory
@@ -49,7 +52,9 @@ data class AppState(
     val history: Map<Int, List<Double>> = emptyMap(),
     val polling: Boolean = false,
     val update: AvailableUpdate? = null,
-    val downloading: Boolean = false
+    val downloading: Boolean = false,
+    val bmwMode: Boolean = false,
+    val bmwIdentities: List<BmwEcuIdentity> = emptyList()
 )
 
 class ObdViewModel(application: Application) : AndroidViewModel(application) {
@@ -57,6 +62,7 @@ class ObdViewModel(application: Application) : AndroidViewModel(application) {
     private val mutable = MutableStateFlow(AppState())
     val state = mutable.asStateFlow()
     private var client: ElmClient? = null
+    private var bmwSession: BmwKdcSession? = null
     private var pollJob: Job? = null
     private var scanCallback: ScanCallback? = null
 
@@ -73,7 +79,7 @@ class ObdViewModel(application: Application) : AndroidViewModel(application) {
                     mutable.update { it.copy(devices = paired, message = if (paired.isEmpty())
                         "Associez l'adaptateur dans les réglages Bluetooth Android." else it.message) }
                 }
-                LinkType.USB -> {
+                LinkType.USB, LinkType.KDCAN -> {
                     val mgr = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
                     val usb = UsbSerialProber.getDefaultProber().findAllDrivers(mgr).map {
                         DeviceOption("${it.device.productName ?: "USB série"} (${it.device.deviceId})",
@@ -122,7 +128,7 @@ class ObdViewModel(application: Application) : AndroidViewModel(application) {
 
     fun connect(spec: ConnectionSpec) = runTask {
         disconnectInternal()
-        if (spec.type == LinkType.USB) {
+        if (spec.type == LinkType.USB || spec.type == LinkType.KDCAN) {
             val mgr = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
             val device = mgr.deviceList.values.firstOrNull { it.deviceId == spec.usbDeviceId }
                 ?: error("USB introuvable")
@@ -135,6 +141,20 @@ class ObdViewModel(application: Application) : AndroidViewModel(application) {
                 return@runTask
             }
         }
+        if (spec.type == LinkType.KDCAN) {
+            check(spec.baudRate == 115200) { "K+DCAN nécessite 115200 bauds" }
+            val usb = TransportFactory.open(ctx, spec)
+            bmwSession = BmwKdcSession(usb)
+            mutable.update {
+                it.copy(connected = true, bmwMode = true,
+                    linkName = "USB K+DCAN (115200)",
+                    adapterName = "Port USB série",
+                    protocolName = "BMW-FAST / D-CAN expérimental",
+                    bmwIdentities = emptyList(),
+                    message = "Port USB ouvert. Identifier les calculateurs BMW pour vérifier la communication.")
+            }
+            return@runTask
+        }
         val endpoint = ElmClient { TransportFactory.open(ctx, spec) }
         endpoint.connect()
         client = endpoint
@@ -143,9 +163,11 @@ class ObdViewModel(application: Application) : AndroidViewModel(application) {
         mutable.update {
             it.copy(
                 connected = true,
+                bmwMode = false,
                 linkName = when (spec.type) {
                     LinkType.WIFI -> "${spec.address}:${spec.port}"
                     LinkType.USB -> "USB (${spec.baudRate} baud)"
+                    LinkType.KDCAN -> "BMW K+DCAN"
                     LinkType.BLE -> "BLE ${spec.address}"
                     LinkType.BLUETOOTH -> "Bluetooth ${spec.address}"
                 },
@@ -181,8 +203,23 @@ class ObdViewModel(application: Application) : AndroidViewModel(application) {
         pollJob = null
         client?.close()
         client = null
-        mutable.update { it.copy(connected = false, polling = false, supported = emptySet(),
+        bmwSession?.close()
+        bmwSession = null
+        mutable.update { it.copy(connected = false, bmwMode = false, bmwIdentities = emptyList(),
+            polling = false, supported = emptySet(),
             message = "Déconnecté", measures = emptyMap(), history = emptyMap()) }
+    }
+
+    /** One read-only identification request per listed E90 ECU; no writes or unsafe retries. */
+    fun identifyBmw() = runTask {
+        val session = requireNotNull(bmwSession) { "Connectez le câble K+DCAN" }
+        mutable.update { it.copy(bmwIdentities = emptyList()) }
+        for ((address, name) in BmwE90Addresses.targets) {
+            val result = session.identify(address, name)
+            mutable.update { it.copy(bmwIdentities = it.bmwIdentities + result,
+                message = "BMW : ${it.bmwIdentities.size + 1} calculateurs interrogés") }
+        }
+        mutable.update { it.copy(message = "Identification BMW terminée ; vérifier les réponses brutes.") }
     }
 
     fun scanFaults() = runTask {
