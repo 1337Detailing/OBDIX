@@ -283,12 +283,38 @@ private fun FaultPage(s: AppState, model: ObdViewModel) {
     var confirm by remember { mutableStateOf(false) }
     if (s.bmwMode) {
         PageTitle("BMW E-Series", "Identification expérimentale des calculateurs via K+DCAN.")
-        Button(onClick = { model.identifyBmw() },
-            enabled = s.connected && !s.busy) { Text("Identifier les calculateurs") }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { model.scanBmwFaults() }, enabled = s.connected && !s.busy) {
+                Text("Scanner défauts BMW")
+            }
+            OutlinedButton(onClick = { model.identifyBmw() },
+                enabled = s.connected && !s.busy) { Text("Identifier") }
+        }
         Spacer(Modifier.height(14.dp))
-        if (s.bmwIdentities.isEmpty()) {
-            NoticeCard("Lecture seule", "Cette étape vérifie la communication BMW-FAST. Lecture des défauts BMW, CBS et codage exigent encore les jobs .PRG spécifiques.")
-        } else s.bmwIdentities.forEach { ecu ->
+        s.bmwFaultReports.forEach { ecu ->
+            ElevatedCard(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                Column(Modifier.padding(16.dp)) {
+                    Text(ecu.name, style = MaterialTheme.typography.titleMedium)
+                    Text(ecu.detail, style = MaterialTheme.typography.bodySmall)
+                    ecu.faults.forEach { fault ->
+                        Spacer(Modifier.height(5.dp))
+                        Text("${fault.code} · ${fault.state}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold)
+                        if (fault.warningRequested) Text("Voyant demandé par le calculateur",
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (ecu.status == BmwResponseState.INVALID &&
+                        ecu.responseHex.isNotBlank()) {
+                        Text(ecu.responseHex, style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+        }
+        if (s.bmwIdentities.isEmpty() && s.bmwFaultReports.isEmpty()) {
+            NoticeCard("Lecture seule", "Lecture expérimentale des défauts BMW sur les principaux ECU E9x. Les descriptions détaillées, les CBS et le codage nécessitent des définitions adaptées à chaque variante.")
+        }
+        s.bmwIdentities.forEach { ecu ->
             ElevatedCard(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
                 Column(Modifier.padding(16.dp)) {
                     Text(ecu.name, style = MaterialTheme.typography.titleMedium)

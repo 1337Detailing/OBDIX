@@ -19,6 +19,7 @@ import androidx.lifecycle.viewModelScope
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.obdix.app.core.*
 import com.obdix.app.bmw.BmwEcuIdentity
+import com.obdix.app.bmw.BmwFaultReport
 import com.obdix.app.bmw.BmwKdcSession
 import com.obdix.app.bmw.BmwE90Addresses
 import com.obdix.app.transport.ConnectionSpec
@@ -54,7 +55,8 @@ data class AppState(
     val update: AvailableUpdate? = null,
     val downloading: Boolean = false,
     val bmwMode: Boolean = false,
-    val bmwIdentities: List<BmwEcuIdentity> = emptyList()
+    val bmwIdentities: List<BmwEcuIdentity> = emptyList(),
+    val bmwFaultReports: List<BmwFaultReport> = emptyList()
 )
 
 class ObdViewModel(application: Application) : AndroidViewModel(application) {
@@ -150,7 +152,7 @@ class ObdViewModel(application: Application) : AndroidViewModel(application) {
                     linkName = "USB K+DCAN (115200)",
                     adapterName = "Port USB série",
                     protocolName = "BMW-FAST / D-CAN expérimental",
-                    bmwIdentities = emptyList(),
+                    bmwIdentities = emptyList(), bmwFaultReports = emptyList(),
                     message = "Port USB ouvert. Identifier les calculateurs BMW pour vérifier la communication.")
             }
             return@runTask
@@ -205,7 +207,7 @@ class ObdViewModel(application: Application) : AndroidViewModel(application) {
         client = null
         bmwSession?.close()
         bmwSession = null
-        mutable.update { it.copy(connected = false, bmwMode = false, bmwIdentities = emptyList(),
+        mutable.update { it.copy(connected = false, bmwMode = false, bmwIdentities = emptyList(), bmwFaultReports = emptyList(),
             polling = false, supported = emptySet(),
             message = "Déconnecté", measures = emptyMap(), history = emptyMap()) }
     }
@@ -220,6 +222,18 @@ class ObdViewModel(application: Application) : AndroidViewModel(application) {
                 message = "BMW : ${it.bmwIdentities.size + 1} calculateurs interrogés") }
         }
         mutable.update { it.copy(message = "Identification BMW terminée ; vérifier les réponses brutes.") }
+    }
+
+    fun scanBmwFaults() = runTask {
+        val session = requireNotNull(bmwSession) { "Connectez le câble K+DCAN" }
+        mutable.update { it.copy(bmwFaultReports = emptyList()) }
+        for ((address, name) in BmwE90Addresses.targets) {
+            val result = session.readFaults(address, name)
+            mutable.update { it.copy(bmwFaultReports = it.bmwFaultReports + result,
+                message = "BMW : ${it.bmwFaultReports.size + 1} calculateurs interrogés") }
+        }
+        val count = mutable.value.bmwFaultReports.sumOf { it.faults.size }
+        mutable.update { it.copy(message = "Scan BMW terminé : $count code(s) valide(s) reçus.") }
     }
 
     fun scanFaults() = runTask {

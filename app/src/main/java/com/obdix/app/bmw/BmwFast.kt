@@ -2,15 +2,11 @@ package com.obdix.app.bmw
 
 import com.obdix.app.transport.ByteTransport
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
-import java.io.IOException
 
-/**
- * BMW-FAST telegram framing on the UART of a compatible K+DCAN interface.
- * This is NOT EDIABAS/.PRG interpretation or ISO-TP over an ELM327.
- */
 data class BmwFastPacket(val target: Int, val source: Int, val payload: List<Int>) {
     init {
         require(target in 0..255 && source in 0..255)
@@ -19,6 +15,7 @@ data class BmwFastPacket(val target: Int, val source: Int, val payload: List<Int
     }
 }
 
+/** Self-contained BMW-FAST UART telegram codec; no EDIABAS code is embedded. */
 object BmwFastCodec {
     fun checksum(bytes: List<Int>): Int = bytes.sum().and(0xFF)
 
@@ -39,47 +36,73 @@ object BmwFastCodec {
         if (bytes.size < 5) return null
         val u = bytes.map { it.toInt() and 0xFF }
         if (u[0] and 0xC0 != 0x80) return null
-        var headSize = 3
-        var payloadSize = u[0] and 0x3F
-        if (payloadSize == 0) {
+        var headerSize = 3
+        var size = u[0] and 0x3F
+        if (size == 0) {
             if (u.size < 6) return null
-            headSize = 4
-            payloadSize = u[3]
-            if (payloadSize == 0) {
+            headerSize = 4
+            size = u[3]
+            if (size == 0) {
                 if (u.size < 8) return null
-                headSize = 6
-                payloadSize = (u[4] shl 8) or u[5]
+                headerSize = 6
+                size = (u[4] shl 8) or u[5]
             }
         }
-        if (payloadSize !in 1..4095 || u.size != headSize + payloadSize + 1) return null
+        if (size !in 1..4095 || u.size != headerSize + size + 1) return null
         if (checksum(u.dropLast(1)) != u.last()) return null
-        return BmwFastPacket(u[1], u[2], u.subList(headSize, u.lastIndex))
+        return BmwFastPacket(u[1], u[2], u.subList(headerSize, u.lastIndex))
     }
 
-    /** Length with checksum, null if header is incomplete or malformed. */
     fun expectedLength(bytes: List<Int>): Int? {
         if (bytes.size < 3 || bytes[0] and 0xC0 != 0x80) return null
         val headerSize: Int
-        val length: Int
+        val size: Int
         if (bytes[0] and 0x3F != 0) {
             headerSize = 3
-            length = bytes[0] and 0x3F
+            size = bytes[0] and 0x3F
         } else {
             if (bytes.size < 4) return null
             if (bytes[3] != 0) {
                 headerSize = 4
-                length = bytes[3]
+                size = bytes[3]
             } else {
                 if (bytes.size < 6) return null
                 headerSize = 6
-                length = bytes[4] * 256 + bytes[5]
+                size = bytes[4] * 256 + bytes[5]
             }
         }
-        return (headerSize + length + 1).takeIf { length in 1..4095 }
+        return (headerSize + size + 1).takeIf { size in 1..4095 }
     }
 }
 
 enum class BmwResponseState { POSITIVE, NEGATIVE, NO_REPLY, INVALID }
+
+data class BmwFault(val code: String, val statusByte: Int) {
+    val state: String get() = when ((statusByte ushr 5) and 3) {
+        3 -> "Actif"
+        1 -> "Mémorisé"
+        2 -> "Intermittent"
+        else -> "État non déterminé"
+    }
+    val warningRequested: Boolean get() = statusByte and 0x80 != 0
+}
+
+object BmwFaultCodec {
+    /**
+     * KWP2000 ReadDTCByStatus (18 02 FF FF), response: 58, count, then
+     * [2-byte manufacturer code, 1-byte status] repeated. Reject truncation.
+     */
+    fun decode(payload: List<Int>): List<BmwFault>? {
+        if (payload.size < 2 || payload[0] != 0x58) return null
+        val count = payload[1]
+        if (count !in 0..100 || payload.size != 2 + count * 3) return null
+        return (0 until count).map { i ->
+            val offset = 2 + i * 3
+            BmwFault("%04X".format((payload[offset] shl 8) or payload[offset + 1]),
+                payload[offset + 2])
+        }
+    }
+}
 
 data class BmwEcuIdentity(
     val address: Int,
@@ -89,90 +112,131 @@ data class BmwEcuIdentity(
     val detail: String
 )
 
+data class BmwFaultReport(
+    val address: Int,
+    val name: String,
+    val status: BmwResponseState,
+    val faults: List<BmwFault>,
+    val responseHex: String,
+    val detail: String
+)
+
 object BmwE90Addresses {
-    // Physical ECU diagnostic addresses used by BMW FAST on E-series.
-    // Actual availability depends on equipment, gateway and vehicle generation.
+    // This is a candidate scan list: absent equipment will not answer.
     val targets = listOf(
         0x12 to "DDE / moteur",
         0x18 to "EGS / boîte",
+        0x29 to "DSC / ABS",
         0x40 to "CAS",
         0x60 to "Combiné",
-        0x72 to "FRM / éclairage"
+        0x01 to "Airbags",
+        0x00 to "JBBF",
+        0x72 to "FRM / éclairage",
+        0x78 to "Climatisation",
+        0x17 to "Pompe carburant",
+        0x64 to "Radar de recul",
+        0x63 to "iDrive"
     )
 }
 
 class BmwKdcSession(private val transport: ByteTransport) {
     private val mutex = Mutex()
+    private val readJobs = mapOf(
+        ReadJob.IDENT to listOf(0x1A, 0x80),
+        ReadJob.FAULTS to listOf(0x18, 0x02, 0xFF, 0xFF)
+    )
+    private enum class ReadJob { IDENT, FAULTS }
+    private data class Reply(val payload: List<Int>?, val message: String)
 
-    /**
-     * Only 0x1A ReadECUIdentification is allowed.
-     * The user-supplied ECU address must match the E90 allowlist.
-     */
-    suspend fun identify(address: Int, name: String): BmwEcuIdentity = mutex.withLock {
+    private suspend fun request(address: Int, name: String, job: ReadJob): Reply = mutex.withLock {
         require(BmwE90Addresses.targets.any { it.first == address && it.second == name }) {
             "Calculateur inconnu"
         }
-        val request = BmwFastCodec.encode(BmwFastPacket(address, 0xF1, listOf(0x1A, 0x90)))
-        val buffer = mutableListOf<Int>()
+        val data = checkNotNull(readJobs[job])
+        val service = data[0]
+        val request = BmwFastCodec.encode(BmwFastPacket(address, 0xF1, data))
+        val accumulator = mutableListOf<Int>()
         try {
             transport.send(request)
-            val response = withTimeout(4500) {
+            val result = withTimeout(5000) {
                 while (true) {
-                    val chunk = transport.receive()
-                    chunk.forEach { buffer.add(it.toInt() and 0xFF) }
-                    check(buffer.size <= 16384) { "Trame BMW trop longue" }
-                    while (buffer.isNotEmpty()) {
-                        if (buffer[0] and 0xC0 != 0x80) {
-                            buffer.removeAt(0)
+                    val fragment = transport.receive()
+                    if (fragment.isEmpty()) { delay(10); continue }
+                    fragment.forEach { accumulator.add(it.toInt() and 0xFF) }
+                    check(accumulator.size <= 16384) { "Trame hors limite" }
+                    while (accumulator.isNotEmpty()) {
+                        if (accumulator[0] and 0xC0 != 0x80) {
+                            accumulator.removeAt(0)
                             continue
                         }
-                        val expected = BmwFastCodec.expectedLength(buffer) ?: break
-                        if (buffer.size < expected) break
+                        val expected = BmwFastCodec.expectedLength(accumulator) ?: break
+                        if (accumulator.size < expected) break
                         val packet = BmwFastCodec.parse(
-                            buffer.take(expected).map { it.toByte() }.toByteArray()
+                            accumulator.take(expected).map { it.toByte() }.toByteArray()
                         )
-                        repeat(expected) { buffer.removeAt(0) }
-                        if (packet == null) continue
-                        // K+DCAN adapters can locally echo the TX packet; ignore it.
-                        if (packet.target != 0xF1 || packet.source != address) continue
-                        if (packet.payload.size >= 3 &&
-                            packet.payload[0] == 0x7F &&
-                            packet.payload[1] == 0x1A &&
-                            packet.payload[2] == 0x78
-                        ) continue // responsePending, within the same overall deadline
-                        return@withTimeout packet
+                        repeat(expected) { accumulator.removeAt(0) }
+                        if (packet == null || packet.target != 0xF1 ||
+                            packet.source != address) continue
+                        if (packet.payload.size >= 3 && packet.payload[0] == 0x7F &&
+                            packet.payload[1] == service && packet.payload[2] == 0x78
+                        ) continue
+                        return@withTimeout packet.payload
                     }
                 }
                 @Suppress("UNREACHABLE_CODE")
-                error("Inaccessible")
+                emptyList<Int>()
             }
-            val hex = response.payload.joinToString(" ") { "%02X".format(it) }
-            val negative = response.payload.size >= 3 &&
-                response.payload[0] == 0x7F && response.payload[1] == 0x1A
-            val positive = response.payload.firstOrNull() == 0x5A
-            BmwEcuIdentity(
-                address, name,
-                when {
-                    negative -> BmwResponseState.NEGATIVE
-                    positive -> BmwResponseState.POSITIVE
-                    else -> BmwResponseState.INVALID
-                },
-                hex,
-                when {
-                    negative -> "Réponse négative : NRC %02X".format(response.payload[2])
-                    positive -> "Réponse positive d'identification"
-                    else -> "Réponse non reconnue, sans interprétation"
-                }
-            )
+            Reply(result, "Réponse BMW-FAST reçue")
         } catch (cancel: CancellationException) {
             throw cancel
         } catch (error: Exception) {
-            BmwEcuIdentity(
-                address, name, BmwResponseState.NO_REPLY, "",
-                "Aucune identification valide : ${error.message ?: "délai dépassé"}"
-            )
+            Reply(null, "Pas de réponse valide : ${error.message ?: "délai dépassé"}")
         }
     }
 
-    suspend fun close() = transport.close()
+    suspend fun identify(address: Int, name: String): BmwEcuIdentity {
+        val response = request(address, name, ReadJob.IDENT)
+        val data = response.payload
+        val positive = data != null && data.size >= 2 && data[0] == 0x5A && data[1] == 0x80
+        val negative = data != null && data.size >= 3 && data[0] == 0x7F && data[1] == 0x1A
+        return BmwEcuIdentity(
+            address, name,
+            when {
+                data == null -> BmwResponseState.NO_REPLY
+                positive -> BmwResponseState.POSITIVE
+                negative -> BmwResponseState.NEGATIVE
+                else -> BmwResponseState.INVALID
+            },
+            data?.joinToString(" ") { "%02X".format(it) }.orEmpty(),
+            when {
+                negative -> "Code de rejet : %02X".format(data!![2])
+                positive -> "Identification reçue (données brutes)"
+                else -> response.message
+            }
+        )
+    }
+
+    suspend fun readFaults(address: Int, name: String): BmwFaultReport {
+        val response = request(address, name, ReadJob.FAULTS)
+        val data = response.payload
+        val decoded = if (data == null) null else BmwFaultCodec.decode(data)
+        val negative = data != null && data.size >= 3 && data[0] == 0x7F && data[1] == 0x18
+        val state = when {
+            data == null -> BmwResponseState.NO_REPLY
+            decoded != null -> BmwResponseState.POSITIVE
+            negative -> BmwResponseState.NEGATIVE
+            else -> BmwResponseState.INVALID
+        }
+        return BmwFaultReport(
+            address, name, state, decoded.orEmpty(),
+            data?.joinToString(" ") { "%02X".format(it) }.orEmpty(),
+            when {
+                decoded != null -> "${decoded.size} défaut(s) renvoyé(s)"
+                negative -> "Rejet ECU : NRC %02X".format(data!![2])
+                else -> response.message
+            }
+        )
+    }
+
+    suspend fun close() = mutex.withLock { transport.close() }
 }
