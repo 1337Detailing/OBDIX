@@ -118,7 +118,7 @@ private fun ObdixApp(model: ObdViewModel = viewModel()) {
                     Tab.DTC -> FaultPage(state, model)
                     Tab.LIVE -> LivePage(state, model)
                     Tab.CODING -> UnavailablePage("Codage BMW",
-                        "Les écritures ne sont pas activées. Il faut un backend EDIABAS validé, les définitions exactes de l'ECU, une sauvegarde et une restauration vérifiées.",
+                        "Les écritures BMW ne sont pas activées. La sauvegarde/restauration des valeurs est préparée et testée, mais nécessite un backend constructeur validé et les définitions exactes de chaque ECU.",
                         "Un ELM327 standard ne permet pas le codage Carly.")
                     Tab.SERVICE -> UnavailablePage("Réinitialisations",
                         "La remise à zéro CBS (vidange, plaquettes et entretien) exige des jobs spécifiques à chaque constructeur et calculateur.",
@@ -472,7 +472,7 @@ private fun SettingsPage(s: AppState, model: ObdViewModel) {
     }
     Spacer(Modifier.height(14.dp))
     NoticeCard("Compatibilité",
-        "ELM327 : défauts émissions et mesures OBD-II. Pour BMW E-series, les autres calculateurs, le codage et les remises à zéro requièrent une implémentation EDIABAS validée.")
+        "ELM327 : défauts émissions et mesures OBD-II. BMW E-Series : lecture expérimentale des défauts constructeur en USB K+DCAN. Codage et remises à zéro non disponibles.")
     Spacer(Modifier.height(12.dp))
     Text("GitHub : github.com/1337Detailing/OBDIX",
         style = MaterialTheme.typography.bodySmall,
